@@ -113,7 +113,7 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
             }
             case 3: {
                 // Websocket connected
-
+                obj.cyStart(); // CY Protocol (CYVELION LTD): start the CY-MUX viewer (negotiate codec, decode)
                 break;
             }
         }
@@ -123,6 +123,92 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
         if (obj.debugmode > 2) { console.log('KSend(' + x.length + '): ' + rstr2hex(x)); }
         if (obj.parent != null) { obj.parent.send(x); }
     }
+
+    // ---- CY Protocol (c) 2026 CYVELION LTD : CY-MUX codec desktop (WebCodecs via cy_viewer.js) ----
+    obj.cyv = null;
+    obj.cyStart = function () {
+        // Needs WebCodecs + the cy_mux.js/cy_viewer.js scripts; otherwise the agent stays on JPEG tiles.
+        if (typeof VideoDecoder === 'undefined' || typeof CYViewer === 'undefined') return;
+        try {
+            obj.cyv = new CYViewer(obj.CanvasId, function (u8) {
+                // CYViewer builds the [cmd 90][size] envelope (Uint8Array); obj.send() wants a binary string.
+                var s = ''; for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); obj.send(s);
+            }, { getStats: obj.cyGetStats || null });
+            obj.cyv.start(); // probes codecs -> sends CY_HELLO -> negotiates (AV1/VP9/H.264-High) -> decodes
+        } catch (e) { obj.cyv = null; }
+    };
+
+    // ---- legacy single-codec CY path (superseded by cy_viewer.js; kept for reference) ----
+    obj.cyDecoder = null;
+    obj.cyHello = function () {
+        if (typeof VideoDecoder === 'undefined') return; // no WebCodecs -> agent stays on JPEG tiles
+        try {
+            var caps = JSON.stringify({ v: 1, codecs: ['h264'], audio: ['opus'], features: ['stats'] });
+            obj.send(obj.shortToStr(90) + obj.shortToStr(4 + caps.length) + caps); // 90 = CY_HELLO
+        } catch (e) { }
+    };
+    obj.cyRequestKeyframe = function () { try { obj.send(obj.shortToStr(94) + obj.shortToStr(4)); } catch (e) { } }; // 94
+    obj.cySetup = function (codec) {
+        try {
+            if (obj.cyDecoder) { try { obj.cyDecoder.close(); } catch (e) { } }
+            obj.cyDecoder = new VideoDecoder({
+                output: function (frame) {
+                    try {
+                        if ((obj.ScreenWidth != frame.displayWidth) || (obj.ScreenHeight != frame.displayHeight)) { obj.setScreenSize(frame.displayWidth, frame.displayHeight); }
+                        if (obj.onPreDrawImage != null) obj.onPreDrawImage();
+                        obj.Canvas.drawImage(frame, 0, 0);
+                        obj.cyLastGoodFrame = Date.now();
+                    } catch (e) { }
+                    frame.close();
+                },
+                error: function (e) { obj.cyRequestKeyframe(); }
+            });
+            obj.cyDecoder.configure({ codec: 'avc1.42E01E', optimizeForLatency: true });
+            obj.cyLastGoodFrame = Date.now();
+            obj.cyRequestKeyframe(); // over a lossy UDP (WebRTC) channel, prime a fresh keyframe
+        } catch (e) { obj.cyDecoder = null; }
+    };
+    obj.cyDecode = function (view, isKey) {
+        if (obj.cyDecoder == null) return;
+        // Watchdog: over a lossy UDP (WebRTC) channel, if no decoded frame for >2s, re-request a keyframe.
+        if (!isKey && obj.cyLastGoodFrame && ((Date.now() - obj.cyLastGoodFrame) > 2000)) { obj.cyRequestKeyframe(); obj.cyLastGoodFrame = Date.now(); }
+        try { obj.cyDecoder.decode(new EncodedVideoChunk({ type: isKey ? 'key' : 'delta', timestamp: (performance.now() * 1000) | 0, data: view.slice(4) })); }
+        catch (e) { obj.cyRequestKeyframe(); }
+    };
+
+    // ---- CY audio (Opus): out = play agent sound; in = send local mic ----
+    obj.cyAudioSetup = function () {
+        if (typeof AudioDecoder === 'undefined') return;
+        try {
+            obj.cyAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+            obj.cyAudioNext = 0;
+            obj.cyAudioDecoder = new AudioDecoder({
+                output: function (ad) {
+                    try {
+                        var ch = ad.numberOfChannels, fr = ad.numberOfFrames;
+                        var abuf = obj.cyAudioCtx.createBuffer(ch, fr, ad.sampleRate), tmp = new Float32Array(fr);
+                        for (var c = 0; c < ch; c++) { ad.copyTo(tmp, { planeIndex: c, format: 'f32-planar' }); abuf.copyToChannel(tmp, c); }
+                        var s = obj.cyAudioCtx.createBufferSource(); s.buffer = abuf; s.connect(obj.cyAudioCtx.destination);
+                        var now = obj.cyAudioCtx.currentTime; if (obj.cyAudioNext < now) obj.cyAudioNext = now + 0.03;
+                        s.start(obj.cyAudioNext); obj.cyAudioNext += abuf.duration;
+                    } catch (e) { } ad.close();
+                },
+                error: function (e) { }
+            });
+            obj.cyAudioDecoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+        } catch (e) { obj.cyAudioDecoder = null; }
+    };
+    obj.cyAudioPlay = function (view) {
+        if (!obj.cyAudioDecoder) return;
+        try { obj.cyAudioDecoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: (performance.now() * 1000) | 0, data: view.slice(4) })); } catch (e) { }
+    };
+    // Mic -> agent (call from a user gesture; browser will prompt for permission).
+    // The live agent (cy_session.c) expects the mic on CY-MUX channel 5 (CYCH_AUDIO_IN) INSIDE cmd-90,
+    // not a raw top-level cmd-98. Delegate to the viewer so the mux framing matches the agent.
+    obj.cyStartMic = function () { if (obj.cyv) return obj.cyv.startMic(); return Promise.resolve(false); };
+    obj.cyStopMic = function () { if (obj.cyv) obj.cyv.stopMic(); };
+    // Resume/unmute speaker audio from a user gesture (autoplay policy).
+    obj.cyEnableAudio = function () { if (obj.cyv) obj.cyv.enableAudio(); };
 
     // KVM Control.
     // Routines for processing incoming packets from the AJAX server, and handling individual messages.
@@ -314,6 +400,25 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
                 if (cursorNum > mouseCursors.length) { cursorNum = 0; }
                 xMouseCursorCurrent = mouseCursors[cursorNum];
                 if (xMouseCursorActive) { obj.CanvasId.style.cursor = xMouseCursorCurrent; }
+                break;
+            // ---- CY Protocol (c) 2026 CYVELION LTD : agent -> viewer codec stream ----
+            case 90: // CY-MUX envelope (new unified path): feed the fragment to cy_viewer.js
+                if (obj.cyv) { obj.cyv.onCyEnvelope(view.slice(4)); }
+                break;
+            case 91: // CY_CONFIG : codec negotiated by the agent; set up the decoder + screen size
+                try { var cfg = JSON.parse(result.substring(4)); if (cfg.screens && cfg.screens[0]) obj.setScreenSize(cfg.screens[0].w, cfg.screens[0].h); obj.cySetup((cfg.chosen && cfg.chosen.codec) || 'h264'); obj.cyAudioSetup(); } catch (e) { }
+                break;
+            case 92: // CY_KEYFRAME (H.264 I-frame)
+                if (obj.FirstDraw) obj.onResize();
+                obj.cyDecode(view, true);
+                break;
+            case 93: // CY_DELTA (H.264 P-frame)
+                obj.cyDecode(view, false);
+                break;
+            case 95: // CY_AUDIO : Opus system sound -> Web Audio playback
+                obj.cyAudioPlay(view);
+                break;
+            case 96: // CY_CURSOR (TODO)
                 break;
             default:
                 console.log('Unknown command', cmd, cmdsize);

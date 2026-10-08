@@ -31,6 +31,8 @@
     <script type="text/javascript" src="scripts/agent-redir-ws-0.1.1{{{min}}}.js"></script>
     <script type="text/javascript" src="scripts/agent-redir-rtc-0.1.0{{{min}}}.js"></script>
     <script type="text/javascript" src="scripts/agent-desktop-0.0.2{{{min}}}.js"></script>
+    <script type="text/javascript" src="scripts/cy_mux.js"></script>
+    <script type="text/javascript" src="scripts/cy_viewer.js"></script>
     <script type="text/javascript" src="scripts/agent-rdp-0.0.1{{{min}}}.js"></script>
     <script type="text/javascript" src="scripts/qrcode.min.js"></script>
     <script type="text/javascript" src="scripts/xterm{{{min}}}.js"></script>
@@ -9675,7 +9677,12 @@
                                 if (typeof RTCPeerConnection !== 'undefined') { webRtcDesktop.webrtc = new RTCPeerConnection(configuration); }
                                 else if (typeof webkitRTCPeerConnection !== 'undefined') { webRtcDesktop.webrtc = new webkitRTCPeerConnection(configuration); }
 
-                                webRtcDesktop.webchannel = webRtcDesktop.webrtc.createDataChannel("DataChannel", {}); // { ordered: false, maxRetransmits: 2 }
+                                // CY Protocol (c) 2026 CYVELION LTD: on CY-capable browsers (WebCodecs), use an
+                                // unordered, limited-retransmit datachannel = low-latency UDP over the direct WebRTC
+                                // P2P path (no TCP head-of-line blocking, bypasses the relay/cloudflared tunnel).
+                                // CY recovers lost frames via keyframe request; JPEG tolerates it (periodic refresh).
+                                var cyLowLatency = (typeof VideoDecoder !== 'undefined');
+                                webRtcDesktop.webchannel = webRtcDesktop.webrtc.createDataChannel("DataChannel", cyLowLatency ? { ordered: false, maxRetransmits: 2 } : {});
                                 webRtcDesktop.webchannel.onopen = function () {
                                     // Switch to software KVM
                                     //if (urlvars && urlvars['kvmdatatrace']) { console.log('WebRTC Data Channel Open'); }

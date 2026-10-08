@@ -13,6 +13,9 @@
 /*jshint esversion: 6 */
 "use strict";
 
+// CY Protocol (c) 2026 CYVELION LTD — codec-based desktop relay (successor to NX). See cyframe.js.
+const CY = require('./cyframe.js');
+
 
 /*
 --- KVM Commands ---
@@ -79,6 +82,10 @@ function CreateDesktopMultiplexor(parent, domain, nodeid, id, func) {
     obj.lastScreenSizeCmd = null;       // Pointer to the last screen size command from the agent.
     obj.lastScreenSizeCounter = 0;      // Index into the image table of the screen size command, this is generally also the first command.
     obj.lastConsoleMessage = null;      // Last agent console message.
+    // CY Protocol (CYVELION LTD) codec-desktop state — cached so new viewers can bootstrap.
+    obj.cyActive = false;               // True once the agent sends a CY_CONFIG (codec mode negotiated).
+    obj.cyConfig = null;                // Last CY_CONFIG frame (codec/audio/screens).
+    obj.cyKeyframe = null;              // Last CY_KEYFRAME frame (full I-frame for late joiners).
     obj.firstData = null;               // Index in the image table of the first image in the table, generally this points to the display resolution command.
     obj.lastData = null;                // Index in the images table of the last image in the table.
     obj.lastDisplayInfoData = null;     // Pointer to the last display information command from the agent (Number of displays).
@@ -123,6 +130,13 @@ function CreateDesktopMultiplexor(parent, domain, nodeid, id, func) {
             peer.sendQueue = [];
             peer.paused = false;
             peer.startTime = Date.now();
+
+            // CY Protocol (c) 2026 CYVELION LTD : bootstrap a late-joining viewer into an active
+            // codec session — send the cached codec config, then ask the agent for a fresh keyframe.
+            if (obj.cyActive) {
+                if (obj.cyConfig != null) { try { peer.ws.send(obj.cyConfig); } catch (ex) { } }
+                try { obj.sendToAgent(CY.build(CY.CY.REQUEST_KEYFRAME)); } catch (ex) { }
+            }
 
             // Add the user to the userids list if needed
             if ((peer.user != null) && (obj.userIds.indexOf(peer.user._id) == -1)) { obj.userIds.push(peer.user._id); }
@@ -653,6 +667,16 @@ function CreateDesktopMultiplexor(parent, domain, nodeid, id, func) {
             case 87: // Remote input lock, forward to agent
                 if (viewer.viewOnly == false) { obj.sendToAgent(data); }
                 break;
+            // ---- CY Protocol (c) 2026 CYVELION LTD : viewer -> agent control ----
+            case CY.CY.HELLO: // 90: viewer capabilities (codec negotiation). Always forward.
+                obj.sendToAgent(data);
+                break;
+            case CY.CY.REQUEST_KEYFRAME: // 94: ask agent for a fresh I-frame
+                obj.sendToAgent(data);
+                break;
+            case CY.CY.STATS: // 97: RTT/loss/fps telemetry for adaptive bitrate
+                obj.sendToAgent(data);
+                break;
             default:
                 console.log('Un-handled viewer command: ' + command);
                 break;
@@ -821,6 +845,20 @@ function CreateDesktopMultiplexor(parent, domain, nodeid, id, func) {
             case 88: // MNG_KVM_MOUSE_CURSOR
                 // Send this to all viewers right away
                 obj.sendToAllInputViewers(data);
+                break;
+            // ---- CY Protocol (c) 2026 CYVELION LTD : agent -> viewers codec stream ----
+            case CY.CY.CONFIG: // 91: codec/audio/screens chosen by agent. Cache for late joiners.
+                obj.cyActive = true; obj.cyConfig = data;
+                obj.sendToAllViewers(data);
+                break;
+            case CY.CY.KEYFRAME: // 92: full I-frame. Cache so a new viewer can start decoding.
+                obj.cyKeyframe = data;
+                obj.sendToAllViewers(data);
+                break;
+            case CY.CY.DELTA: // 93: inter P-frame
+            case CY.CY.AUDIO: // 95: Opus audio
+            case CY.CY.CURSOR: // 96: cursor shape/pos
+                obj.sendToAllViewers(data);
                 break;
             default:
                 console.log('Un-handled agent command: ' + command + ', length: ' + cmdsize);
